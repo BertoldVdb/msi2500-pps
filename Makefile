@@ -3,7 +3,7 @@
 CC      = sdcc
 CFLAGS  = -I.. -mmcs51 --model-small --std-sdcc99 \
           --code-loc 0x0000 --code-size 0x1800 \
-          --xram-loc 0x1800 --xram-size 0x07F8 \
+          --xram-loc 0x1C00 --xram-size 0x0100 \
           --iram-size 256 \
           --opt-code-size --Werror
 

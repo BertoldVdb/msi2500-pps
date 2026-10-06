@@ -154,6 +154,7 @@ volatile __sfr __at (0xC5) CORERESET;
 /* This value is written on USB suspend. Copied from libmirisdr */
 #define MMIO_ANALOG_STANDBY 0x010000UL
 
+#define MMIO_REG_TUNER      0x09    /* the MSi001's serial port, ~2.15 us a word */
 #define MMIO_REG_GPIO       0x08    /* val bit 7 picks the GPIO supply, 1.8 V or 1.2 V,
                                      * val[15:12] = direction (1 = output),
                                      * val[11:8]  = output value         */

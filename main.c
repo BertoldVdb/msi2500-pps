@@ -40,6 +40,9 @@
 #define REQ_I2C_STATUS          0x57    /* one byte, 0 = the last op was ACKed */
 #define REQ_I2C_RESET           0x58    /* wIndex = delay: recover a stuck bus */
 #define REQ_CALL                0x59    /* wValue = address, entry state in callCtx */
+#define REQ_REG_LIST            0x5A    /* wValue bit 0 bank, bit 1 queue it; wIndex = port gap,
+                                           0 default; data = list entries, none = stop */
+#define REQ_REG_LIST_STATUS     0x5B    /* 4 B: flags, entry, passes (16 bit) */
 
 /* wValueH flag shared by the two I2C transfer requests */
 #define I2C_NO_STOP             0x01    /* leave the bus for a repeated start */
@@ -49,6 +52,7 @@
 #define ACT_NONE                0
 #define ACT_UART                1
 #define ACT_I2C_WRITE           2
+#define ACT_REG_LIST            3
 
 #define FEATURE_ENDPOINT_HALT   0
 
@@ -253,8 +257,10 @@ static __xdata uint8_t  callR0, callR1, callA, callB, callDpl, callDph;
 static __xdata uint8_t  callInA, callInB, callInDpl, callInDph;
 
 /* The entry state for REQ_CALL, which the host writes with request 0x44:
-   A, B, DPL, DPH, R0, R1, then two spare.  The Makefile keeps --xram-size
-   below it so the allocator cannot grow into these eight bytes. */
+   A, B, DPL, DPH, R0, R1, then two spare. The Makefile keeps --xram-size
+   below it so the allocator cannot grow into these eight bytes. Code ends
+   below 0x1800 and xdata is 0x1C00-0x1CFF: 0x1A00-0x1BFF is for the host's
+   stubs. And 0x1800-0x19FF is reserved. */
 __xdata __at (0x1FF8) uint8_t callCtx[8];
 
 static void doCall(void)
@@ -540,6 +546,201 @@ static void uartSend(uint8_t n)
         reg8Shadow |=  GPIO_VAL(PIN_SCL); gpioApply(); bitDelay();
     }
     usbGuard = 2;                       /* done: back to the normal decay */
+}
+
+/* ------------------------------------------------------------------ */
+/* Register lists                                                     */
+/* ------------------------------------------------------------------ */
+
+/* A list is 4 byte entries, [register or command, low, mid, high]. A register
+   below 0x20 is written as request 0x41 would. It runs from main.
+   Two banks, so the host can load one while the other runs. PPS pauses while
+   a list runs, as the poll loop holds main, and resumes when it ends. */
+#define LIST_WAIT_US            0x80    /* busy wait, microseconds, 16 bit */
+#define LIST_WAIT_IRQ           0x81    /* streaming interrupts, 16 bit, counted from
+                                           the end of the wait before, so hops do not drift */
+#define LIST_REPEAT             0x82    /* back to the start, n more passes, 0 = forever */
+#define LIST_SWITCH             0x83    /* to the other bank, if it is queued */
+#define LIST_WAIT_SPI           0x84    /* the SPI master's done flags, at most n polls (~0.5 us
+                                           each, 0 = 65536); a timeout stops the list */
+#define LIST_BANK_BYTES         252     /* 63 entries, so offsets in a bank fit a byte */
+#define LIST_PAGE               0x1D    /* bank 0 at 0x1D00, bank 1 at 0x1E00 */
+#define LIST_GAP_DEFAULT        53      /* 2 cycle turns, 3.5 us: a port word takes ~2.15 us */
+
+/* Each bank on its own page: an entry's address is the page and a byte offset.
+   The Makefile keeps the allocated xdata below 0x1D00. */
+__xdata __at (LIST_PAGE << 8) uint8_t listBuf[2][256];
+static __xdata uint8_t listLen[2];      /* bytes */
+static __xdata uint8_t listLoad;        /* the bank being loaded, bit 1 to queue it */
+static __data uint8_t listQueued;       /* bank bits loaded behind the running one */
+static __data uint8_t listBank;
+static __data uint8_t listGap = LIST_GAP_DEFAULT;
+static __data uint8_t listPage, listPos, listEnd;   /* the running bank's page, offsets */
+static __data uint32_t listVal;          /* the entry being run */
+static __data uint16_t listPass;
+static __data uint16_t listCount;       /* streaming interrupts left to wait */
+static __data uint8_t gapCount, usCount, usL, usH;
+static volatile __bit listRun;          /* a list is active */
+static volatile __bit listWaiting;      /* the streaming interrupt counts listCount */
+static volatile __bit listDue;          /* main has a step to take */
+static volatile __bit ppsPaused;        /* PPS was on when the list started */
+static volatile __bit listSpiTimeout;   /* the last list stopped waiting for SPI */
+
+/* Let the tuner port finish shifting before anything else writes it */
+static void portGap(void) __naked
+{
+    __asm
+        mov     _gapCount,_listGap
+    00001$:
+        djnz    _gapCount,00001$        ; 2 cycles a turn
+        ret
+    __endasm;
+}
+
+/* usH:usL turns of 32 cycles, ~1.07 us; usH already raised by one when usL is not 0.
+   A stop from the host ends it early. */
+static void waitUs(void) __naked
+{
+    __asm
+    00001$:
+        mov     _usCount,#13            ; 2
+    00002$:
+        djnz    _usCount,00002$         ; 26
+        jnb     _listRun,00003$         ; 2
+        djnz    _usL,00001$             ; 2
+        djnz    _usH,00001$
+    00003$:
+        ret
+    __endasm;
+}
+
+static void listStart(uint8_t bank)
+{
+    listBank = bank;
+    listPage = LIST_PAGE + bank;
+    listPos = 0;
+    listEnd = listLen[bank];
+    listPass = 0;
+}
+
+/* to the other bank if it is queued */
+static uint8_t listSwitch(void)
+{
+    uint8_t other = listBank ^ 1, bit = other ? 2 : 1;
+
+    if (!(listQueued & bit)) return 0;
+    listQueued &= (uint8_t) ~bit;
+    listStart(other);
+    return 1;
+}
+
+static void listStep(void)
+{
+    uint8_t op;
+    uint16_t arg;
+
+    listDue = 0;
+
+    for (;;) {
+        /* Take the entry with interrupts off: a load stops the list before it writes
+           a bank, so a running list never reads one half loaded */
+        EA = 0;
+        if (listRun && listPos == listEnd && !listSwitch()) listRun = 0;
+        if (!listRun) {
+            EA = 1;
+            break;
+        }
+        listVal = *(__xdata uint32_t *)(((uint16_t)listPage << 8) | listPos);
+        listPos += 4;
+        EA = 1;
+
+        /* laid out as the port is: register, then the value */
+        op = (uint8_t)listVal;
+        listVal >>= 8;
+
+        if (op < 0x20) {
+            /* the shadows are shared with the USB interrupt's UART and I2C code */
+            EA = 0;
+            mmioWrite(op, listVal);
+            EA = 1;
+            if (op == MMIO_REG_TUNER) portGap();
+            continue;
+        }
+
+        arg = (uint16_t)listVal;
+
+        switch (op) {
+        case LIST_WAIT_US:
+            if (!arg) break;
+            usL = (uint8_t)arg;
+            usH = (uint8_t)(arg >> 8);
+            if (usL) usH++;
+            waitUs();
+            break;
+
+        case LIST_WAIT_IRQ:
+            if (!arg) break;
+            EA = 0;
+            listCount = arg;
+            listWaiting = 1;
+            EA = 1;
+            return;
+
+        case LIST_REPEAT:
+            if (!arg || listPass < arg) {
+                listPass++;
+                listPos = 0;
+            }
+            break;
+
+        case LIST_SWITCH:
+            EA = 0;
+            listSwitch();
+            EA = 1;
+            break;
+
+        case LIST_WAIT_SPI:
+            /* read index 5 bits 5 and 4 together, as the EEPROM code polls them: bit 5
+               alone comes back ~0.7 us into a transfer, both at its end */
+            while (listRun && (*MMIO_RD(5) & 0x30) != 0x30) {
+                if (!--arg) {
+                    listSpiTimeout = 1;
+                    listRun = 0;
+                    break;
+                }
+            }
+            break;
+
+        default:
+            listRun = 0;
+            break;
+        }
+    }
+}
+
+/* From the EP0 handler, when a list has arrived */
+static void listLoaded(void)
+{
+    uint8_t bank = listLoad & 1;
+
+    listLen[bank] = (uint8_t)(uint16_t)ep0Ptr;     /* the bank starts on a page */
+
+    /* queued behind a list that is still running, start now? */
+    if ((listLoad & 2) && listRun) {
+        listQueued |= bank ? 2 : 1;
+        return;
+    }
+
+    if (ppsRun) {
+        ppsRun = 0;
+        ppsPaused = 1;
+        tickL = 1;                      /* force the poll loop out on its next DJNZ */
+    }
+
+    listStart(bank);
+    listSpiTimeout = 0;
+    listRun = 1;
+    listDue = 1;
 }
 
 /* ------------------------------------------------------------------ */
@@ -909,11 +1110,56 @@ static void handleSetup(void)
         break;
 
     case REQ_WRITE_REG:
+        /* a running list owns the registers: a write could land between its words, or
+           reach the tuner port or the SPI master while the other is on the shared lines */
+        if (listRun) { ep0Stall(); break; }
         mmioWrite(setup.wValueL,
                   (uint32_t)setup.wValueH
                   | ((uint32_t)setup.wIndexL << 8)
                   | ((uint32_t)setup.wIndexH << 16));
+        if (setup.wValueL == MMIO_REG_TUNER) portGap();    /* a list may start next */
         ep0Ack();
+        break;
+
+    case REQ_REG_LIST: {
+        uint8_t bank = setup.wValueL & 1, queue = setup.wValueL & 2;
+
+        if (queue && listRun) {
+            /* the running bank cannot be loaded under it */
+            if (bank == listBank || !setup.wLength) { ep0Stall(); break; }
+        } else {
+            listRun = 0;
+            listWaiting = 0;
+            listDue = 0;
+            listQueued = 0;
+            queue = 0;
+        }
+
+        if (!setup.wLength) { ep0Ack(); break; }    /* stop */
+
+        if ((setup.wLength & 3) || setup.wLength > LIST_BANK_BYTES) { ep0Stall(); break; }
+
+        listGap = setup.wIndexL ? setup.wIndexL : LIST_GAP_DEFAULT;
+        listQueued &= (uint8_t) ~(bank ? 2 : 1);
+        listLoad = bank | queue;
+        ep0Ptr = (__xdata uint8_t *)((uint16_t)(LIST_PAGE + bank) << 8);
+        ep0Remap = 0;
+        ep0Action = ACT_REG_LIST;
+        USB_CSR0 = CSR0_SERV_RXPKTRDY;
+        ep0State = EP0_RX;
+        break;
+    }
+
+    case REQ_REG_LIST_STATUS:
+        USB_CSR0 = CSR0_SERV_RXPKTRDY;
+        USB_FIFO0[0] = (listRun ? 1 : 0) | (listWaiting ? 2 : 0) | (uint8_t)(listQueued << 2)
+                     | (uint8_t)(listBank << 4) | (ppsPaused ? 0x20 : 0)
+                     | (listSpiTimeout ? 0x40 : 0);
+        USB_FIFO0[1] = listPos >> 2;
+        USB_FIFO0[2] = (uint8_t)listPass;
+        USB_FIFO0[3] = (uint8_t)(listPass >> 8);
+        setup.wLength = 0;
+        USB_CSR0 = CSR0_TXPKTRDY | CSR0_DATAEND;
         break;
 
     case REQ_READ_MEM:
@@ -1021,10 +1267,15 @@ static void handleSetup(void)
         sofDiv = 1;
 
         if (setup.wValueL & 1) {
-            if (!ppsRun) { tickL = 0; tickH = 0; ppsDiv = 1; }
-            ppsRun = 1;
+            if (listRun) {
+                ppsPaused = 1;          /* starts when the list ends */
+            } else {
+                if (!ppsRun) { tickL = 0; tickH = 0; ppsDiv = 1; }
+                ppsRun = 1;
+            }
         } else {
             ppsRun = 0;
+            ppsPaused = 0;
             tickL = 1; /* force the poll loop out on its next DJNZ */
         }
 
@@ -1170,7 +1421,8 @@ static void ep0Receive(void)
         if (ep0Action != ACT_NONE) {
             uint8_t act = ep0Action, n = (uint8_t)(ep0Ptr - xferBuf);
             ep0Action = ACT_NONE;
-            if (act == ACT_UART) uartSend(n);
+            if (act == ACT_REG_LIST) listLoaded();
+            else if (act == ACT_UART) uartSend(n);
             else                 i2cWriteXfer(n);
         }
     } else {
@@ -1206,6 +1458,11 @@ void streamIsr(void) __interrupt (0) __using (1)
     tickCarried = !lastTickL;
     if (usbGuard && usbGuard != GUARD_HELD) usbGuard--;
     irqCount++;
+
+    if (listWaiting && !--listCount) {
+        listWaiting = 0;
+        listDue = 1;                    /* main wakes from idle on this interrupt */
+    }
 
     if (anchorPending) {
         __xdata uint8_t *b = (__xdata uint8_t *)0xE000;
@@ -1499,9 +1756,27 @@ void main(void)
     USB_POWER = PWR_RUN;
 
     for (;;) {
-        if (ppsRun)
+        if (listDue)
+            listStep();
+
+        if (ppsPaused && !listRun) {
+            EA = 0;
+            ppsPaused = 0;
+            tickL = 0; tickH = 0; ppsDiv = 1;
+            ppsRun = 1;
+            STREAM_GUARD();             /* the first interval is partial */
+            EA = 1;
+        }
+
+        if (ppsRun) {
             ppsPoll();
-        else
-            PCON = 1;
+        } else {
+            EA = 0;
+            if (!listDue) {
+                EA = 1;                 /* the instruction after this runs before any */
+                PCON = 1;               /* interrupt, so a step raised now still wakes us */
+            }
+            EA = 1;
+        }
     }
 }
