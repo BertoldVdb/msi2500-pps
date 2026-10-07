@@ -21,6 +21,7 @@ $(TARGET).ihx: $(SRC) msi2500.h
 
 $(TARGET).bin: $(TARGET).ihx tools/stampid.py
 	makebin -p $< $@
+	@test $$(stat -c %s $@) -le 6144 || { echo "$@ ends past 0x1800"; rm -f $@; exit 1; }
 	python3 tools/stampid.py $@
 	@echo "--- size ---"
 	@ls -l $@

@@ -32,9 +32,7 @@ This produces:
 
 | Request | Purpose |
 |---------|---------|
-| `0x51`  | Read the PPS timestamp counters |
 | `0x52`  | Enable/disable PPS capture, select source and divider, request an anchor |
-| `0x53`  | Read the captured sample-counter anchor |
 | `0x54`  | UART transmit (`wValue` = bit delay) |
 | `0x55`  | I2C write (`wValue` = address and flags, `wIndex` = delay) |
 | `0x56`  | I2C read |
@@ -42,7 +40,6 @@ This produces:
 | `0x58`  | Recover a stuck I2C bus |
 | `0x59`  | Call a function at `wValue`, entry state in `callCtx` (0x1FF8); 0x1A00-0x1BFF is free for the code, 0x1800-0x19FF is reserved |
 | `0x5A`  | Load a register list into a bank (`wValue` bit 0), run it or queue it (bit 1); `wIndex` = tuner port gap; no data = stop |
-| `0x5B`  | Register list status: flags, entry, passes |
 
 List entries are 4 bytes, `[register, value low, mid, high]` for a register below `0x20`, or a command with a 16 bit argument: `0x80` wait microseconds, `0x81` wait stream interrupts (counted from the previous wait), `0x82` repeat from the start, `0x83` switch to the queued bank, `0x84` wait for the SPI master's done flag.
 

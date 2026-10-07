@@ -23,7 +23,7 @@
 /* Vendor requests, see msi2500/cmd.txt */
 #define REQ_BOOT                0x40    /* wValue bit0: 0 = ROM, 1 = RAM  */
 #define REQ_WRITE_REG           0x41    /* wValue/wIndex = MMIO reg+data  */
-#define REQ_READ_MEM            0x42    /* wIndex + 0xC000, returns 4 B   */
+#define REQ_READ_MEM            0x42    /* wIndex + 0xC000, up to 64 B at once */
 #define REQ_START_STREAM        0x43
 #define REQ_WRITE_MEM           0x44    /* wValue = address, data stage   */
 #define REQ_STOP_STREAM         0x45
@@ -31,9 +31,7 @@
 /* libmirisdr documents other requests, but my device doesn't respond to them.
  * We keep this region free and put our own requests starting from 0x51 */
 
-#define REQ_PPS_TIME            0x51    /* read the PPS timestamp counters  */
 #define REQ_PPS_ENABLE          0x52    /* bit 0 run, bit 1 take an anchor */
-#define REQ_PPS_ANCHOR          0x53    /* read the captured sample counters  */
 #define REQ_UART_TX             0x54    /* wValue = bit delay, data = bytes   */
 #define REQ_I2C_WRITE           0x55    /* wValue = addr|flags, wIndex = delay */
 #define REQ_I2C_READ            0x56    /* same, data stage comes back        */
@@ -42,7 +40,6 @@
 #define REQ_CALL                0x59    /* wValue = address, entry state in callCtx */
 #define REQ_REG_LIST            0x5A    /* wValue bit 0 bank, bit 1 queue it; wIndex = port gap,
                                            0 default; data = list entries, none = stop */
-#define REQ_REG_LIST_STATUS     0x5B    /* 4 B: flags, entry, passes (16 bit) */
 
 /* wValueH flag shared by the two I2C transfer requests */
 #define I2C_NO_STOP             0x01    /* leave the bus for a repeated start */
@@ -107,13 +104,82 @@ static __code uint8_t stringProduct[24] = {
 
 static __code uint8_t stringSerial[26] = { 0, DESC_STRING };
 
+/* PPS state for the host to read */
+struct ppsState {
+    uint8_t  lastTickL, lastTickH;
+    uint32_t irqCount;                  /* packet interrupts since stream start */
+    uint8_t  edgeTickL, edgeTickH;
+    uint32_t edgeIrq;
+    uint8_t  run;                       /* ppsRun, which the poll loop tests as a bit */
+    uint8_t  edgeUsbGuard, edgeCount, edgeFirstCarry;
+    uint8_t  edgeFrameL, edgeFrameH;    /* USB frame the edge fell in */
+    uint8_t  spare;
+    uint8_t  ppsDivReload;              /* latch every Nth edge */
+    uint8_t  lastSofCount, edgeSofCount, edgeFirstL, edgeFirstH;
+};
+
+/* One-shot anchor for the host to read */
+struct anchorState {
+    uint8_t  anchor[16];
+    uint8_t  valid;
+};
+
+/* List state */
+struct listState {
+    uint8_t  run;                       /* a list is active */
+    uint8_t  waiting;                   /* the streaming interrupt counts listCount */
+    uint8_t  ppsPaused;                 /* PPS was on when the list started */
+    uint8_t  spiTimeout;                /* the last list stopped waiting for SPI */
+    uint8_t  queued;                    /* bank bits loaded behind the running one */
+    uint8_t  bank;
+    uint8_t  pos;                       /* the running bank's next entry, bytes */
+    uint16_t pass;
+};
+
+static __data struct ppsState ppsBlk;
+static __xdata struct anchorState anchorBlk;
+static volatile __data struct listState listBlk;
+
+#define lastTickL       ppsBlk.lastTickL
+#define lastTickH       ppsBlk.lastTickH
+#define irqCount        ppsBlk.irqCount
+#define edgeTickL       ppsBlk.edgeTickL
+#define edgeTickH       ppsBlk.edgeTickH
+#define edgeIrq         ppsBlk.edgeIrq
+#define edgeUsbGuard    ppsBlk.edgeUsbGuard
+#define edgeCount       ppsBlk.edgeCount
+#define edgeFirstCarry  ppsBlk.edgeFirstCarry
+#define edgeFrameL      ppsBlk.edgeFrameL
+#define edgeFrameH      ppsBlk.edgeFrameH
+#define ppsDivReload    ppsBlk.ppsDivReload
+#define lastSofCount    ppsBlk.lastSofCount
+#define edgeSofCount    ppsBlk.edgeSofCount
+#define edgeFirstL      ppsBlk.edgeFirstL
+#define edgeFirstH      ppsBlk.edgeFirstH
+#define anchor          anchorBlk.anchor
+#define anchorValid     anchorBlk.valid
+#define listRun         listBlk.run
+#define listWaiting     listBlk.waiting
+#define ppsPaused       listBlk.ppsPaused
+#define listSpiTimeout  listBlk.spiTimeout
+#define listQueued      listBlk.queued
+#define listBank        listBlk.bank
+#define listPos         listBlk.pos
+#define listPass        listBlk.pass
+
+/* ppsRun with its copy for the host */
+#define PPS_RUN(v)      do { ppsRun = (v); ppsBlk.run = (v); } while (0)
+
 /* This block is read by the driver to identify the firmware */
 struct fwInfo {
     uint8_t  magic[4];
     uint8_t  id[8];                     /* filled in after linking */
     __code uint8_t *deviceDesc;
     __code uint8_t *stringSerial;
-    uint8_t  spare[8];
+    __data struct ppsState *ppsAt;      /* the blocks above, internal RAM, */
+    __xdata struct anchorState *anchorAt;   /* xdata, */
+    volatile __data struct listState *listAt;   /* internal RAM */
+    uint8_t  spare[4];
 };
 
 __code __at (0x0040) struct fwInfo fwBlock = {
@@ -121,7 +187,10 @@ __code __at (0x0040) struct fwInfo fwBlock = {
     { 0, 0, 0, 0, 0, 0, 0, 0 },
     deviceDesc,
     stringSerial,
-    { 0, 0, 0, 0, 0, 0, 0, 0 }
+    &ppsBlk,
+    &anchorBlk,
+    &listBlk,
+    { 0, 0, 0, 0 }
 };
 
 static __code uint8_t qualifierDesc[10] = {
@@ -172,41 +241,28 @@ static __xdata uint8_t rebootPending;   /* 0 none, else target + 1: see
 static __data uint8_t  tickL, tickH; /* both count down: DJNZ is the cheapest count, and
                                         tickH reaching zero again is 65536 turns with no
                                         packet, the poll loop's own way out */
-static __data uint8_t  lastTickL, lastTickH;
-static __data uint32_t irqCount;     /* packet interrupts since stream start */
 static volatile __bit stopPending;   /* stop at the next interrupt, not here  */
 static volatile __bit streamParked;  /* one buffer handed over but not acked  */
-static __data uint8_t  edgeTickL, edgeTickH;
-static __data uint32_t edgeIrq;
 static __bit ppsRun;                 /* poll loop runs only while this is set */
 static __bit ppsSrcSof;              /* edges from the SOF interrupt, not GPIO_0 */
 static __data uint8_t sofDiv, sofLastFrame;
 /* SOF interrupts since the last streaming interrupt, and the tick the first of
    them fell on.  A host places the edge from that first SOF plus a whole number
    of microframes, so what the handlers in between cost never enters the answer. */
-static __data uint8_t sofInInterval, lastSofCount, edgeSofCount;
+static __data uint8_t sofInInterval;
 static __data uint8_t firstSofL, firstSofH, firstSofCarry;
-static __data uint8_t edgeFirstL, edgeFirstH, edgeFirstCarry;
 static volatile __bit inSofLatch;    /* the USB handler is running: a packet interrupt
                                         taken late in here marks the interval */
 static volatile __bit sofStraddle;   /* ...and a streaming interrupt landed there */
 static volatile __bit tickCarried;   /* the interval opened on the loop's carry */
-static __data uint8_t edgeCount;
-static __data uint8_t edgeFrameL, edgeFrameH;   /* USB frame the edge fell in */
-static __data uint8_t ppsDiv, ppsDivReload;     /* latch every Nth edge        */
+static __data uint8_t ppsDiv;                   /* counts down to the Nth edge  */
 
-/* One-shot anchor.  The header's sample counter lives in the capture buffers at
-   0xE000, readable only while they are mapped, and reading it mid stream
-   corrupts a few samples - which the next blocks heal. */
-static __xdata uint8_t anchor[16];
 static volatile __xdata uint8_t anchorPending;   /* the ISR clears it while a handler waits */
-static __xdata uint8_t anchorValid;
 
 /* A USB interrupt freezes the poll loop ~19 us against the streaming one's
    ~2.3 us and leaves `ticks` looking normal, so captures near one are thrown
    away. */
 static __data uint8_t usbGuard;
-static __data uint8_t edgeUsbGuard;
 
 /* Guard values that are markers rather than a count.  The ordinary ones are a
    countdown of streaming interrupts, so they stay plain numbers. */
@@ -572,19 +628,12 @@ static void uartSend(uint8_t n)
 __xdata __at (LIST_PAGE << 8) uint8_t listBuf[2][256];
 static __xdata uint8_t listLen[2];      /* bytes */
 static __xdata uint8_t listLoad;        /* the bank being loaded, bit 1 to queue it */
-static __data uint8_t listQueued;       /* bank bits loaded behind the running one */
-static __data uint8_t listBank;
 static __data uint8_t listGap = LIST_GAP_DEFAULT;
-static __data uint8_t listPage, listPos, listEnd;   /* the running bank's page, offsets */
+static __data uint8_t listPage, listEnd;   /* the running bank's page, end offset */
 static __data uint32_t listVal;          /* the entry being run */
-static __data uint16_t listPass;
 static __data uint16_t listCount;       /* streaming interrupts left to wait */
 static __data uint8_t gapCount, usCount, usL, usH;
-static volatile __bit listRun;          /* a list is active */
-static volatile __bit listWaiting;      /* the streaming interrupt counts listCount */
 static volatile __bit listDue;          /* main has a step to take */
-static volatile __bit ppsPaused;        /* PPS was on when the list started */
-static volatile __bit listSpiTimeout;   /* the last list stopped waiting for SPI */
 
 /* Let the tuner port finish shifting before anything else writes it */
 static void portGap(void) __naked
@@ -597,16 +646,17 @@ static void portGap(void) __naked
     __endasm;
 }
 
-/* usH:usL turns of 32 cycles, ~1.07 us; usH already raised by one when usL is not 0.
+/* usH:usL turns of 31 cycles, ~1.03 us; usH already raised by one when usL is not 0.
    A stop from the host ends it early. */
 static void waitUs(void) __naked
 {
     __asm
     00001$:
-        mov     _usCount,#13            ; 2
+        mov     _usCount,#12            ; 2
     00002$:
-        djnz    _usCount,00002$         ; 26
-        jnb     _listRun,00003$         ; 2
+        djnz    _usCount,00002$         ; 24
+        mov     a,(_listBlk + 0)        ; 1, listRun
+        jz      00003$                  ; 2
         djnz    _usL,00001$             ; 2
         djnz    _usH,00001$
     00003$:
@@ -732,7 +782,7 @@ static void listLoaded(void)
     }
 
     if (ppsRun) {
-        ppsRun = 0;
+        PPS_RUN(0);
         ppsPaused = 1;
         tickL = 1;                      /* force the poll loop out on its next DJNZ */
     }
@@ -990,37 +1040,27 @@ static void handleSetInterface(void)
     ep0Ack();
 }
 
-/* ------------------------------------------------------------------ */
-/* Vendor requests                                                     */
-/* ------------------------------------------------------------------ */
-
 static void handleReadMemory(void)
 {
-    __xdata uint8_t *p;
-    uint8_t a, b, c, d;
-
-    USB_CSR0 = CSR0_SERV_RXPKTRDY;
-
-    p = (__xdata uint8_t *)(uint16_t)
+    __xdata uint8_t *p = (__xdata uint8_t *)(uint16_t)
         (0xC000 + (setup.wIndexL | ((uint16_t)setup.wIndexH << 8)));
+    __idata uint8_t *q = (__idata uint8_t *)setup.wIndexL;
+    uint8_t n = setup.wLength > sizeof xferBuf ? sizeof xferBuf : (uint8_t)setup.wLength;
+    uint8_t i;
 
-    if (setup.wValueL & 1) {
-        /* This unmaps the USB controller FIFO memory so can only be done while the USB is idle */
-        EA = 0;
-        MEM_BUF_MAP(1);
-        a = p[0]; b = p[1]; c = p[2]; d = p[3];
-        MEM_BUF_MAP(0);
-        EA = 1;
-    } else {
-        a = p[0]; b = p[1]; c = p[2]; d = p[3];
-    }
+    EA = 0;
+    if (setup.wValueL & 1) MEM_BUF_MAP(1);
+    if (setup.wValueL & 2)
+        for (i = 0; i < n; i++) xferBuf[i] = q[i];
+    else
+        for (i = 0; i < n; i++) xferBuf[i] = p[i];
+    MEM_BUF_MAP(0);
+    EA = 1;
 
-    USB_FIFO0[0] = a;
-    USB_FIFO0[1] = b;
-    USB_FIFO0[2] = c;
-    USB_FIFO0[3] = d;
-
-    USB_CSR0 = CSR0_TXPKTRDY | CSR0_DATAEND;
+    /* code and xdata are one RAM: the descriptor path sends it */
+    ep0CodePtr = (__code uint8_t *)xferBuf;
+    ep0TypeByte = xferBuf[1];
+    ep0StartTx(n);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1106,7 +1146,7 @@ static void handleSetup(void)
     case REQ_BOOT:
         ep0Ack();
         rebootPending = (setup.wValueL & 1) + 1;
-        ppsRun = 0;                     /* main takes the reboot if no interrupt does */
+        PPS_RUN(0);                     /* main takes the reboot if no interrupt does */
         break;
 
     case REQ_WRITE_REG:
@@ -1149,18 +1189,6 @@ static void handleSetup(void)
         ep0State = EP0_RX;
         break;
     }
-
-    case REQ_REG_LIST_STATUS:
-        USB_CSR0 = CSR0_SERV_RXPKTRDY;
-        USB_FIFO0[0] = (listRun ? 1 : 0) | (listWaiting ? 2 : 0) | (uint8_t)(listQueued << 2)
-                     | (uint8_t)(listBank << 4) | (ppsPaused ? 0x20 : 0)
-                     | (listSpiTimeout ? 0x40 : 0);
-        USB_FIFO0[1] = listPos >> 2;
-        USB_FIFO0[2] = (uint8_t)listPass;
-        USB_FIFO0[3] = (uint8_t)(listPass >> 8);
-        setup.wLength = 0;
-        USB_CSR0 = CSR0_TXPKTRDY | CSR0_DATAEND;
-        break;
 
     case REQ_READ_MEM:
         handleReadMemory();
@@ -1212,55 +1240,6 @@ static void handleSetup(void)
         break;
 
 
-    case REQ_PPS_TIME: {
-        /* Sample everything with IRQ disabled */
-        uint8_t  sLastL, sLastH, sGuard, sCount, sFrameL, sFrameH;
-        uint8_t  sEdgeL, sEdgeH, sLastSof, sEdgeSof, sFirstL, sFirstH, sFirstC;
-        uint32_t sIrq, sEdgeIrq;
-
-        EA = 0;
-        sLastL   = lastTickL;   sLastH   = lastTickH;
-        sIrq     = irqCount;
-        sEdgeL   = edgeTickL;   sEdgeH   = edgeTickH;
-        sEdgeIrq = edgeIrq;
-        sGuard   = edgeUsbGuard;
-        sCount   = edgeCount;
-        sFrameL  = edgeFrameL;  sFrameH  = edgeFrameH;
-        sLastSof = lastSofCount; sEdgeSof = edgeSofCount;
-        sFirstL  = edgeFirstL;   sFirstH  = edgeFirstH;
-        sFirstC  = edgeFirstCarry;
-        EA = 1;
-
-        USB_CSR0 = CSR0_SERV_RXPKTRDY;
-        USB_FIFO0[0] = sLastL;
-        USB_FIFO0[1] = sLastH;
-        USB_FIFO0[2] = (uint8_t)sIrq;
-        USB_FIFO0[3] = (uint8_t)(sIrq >> 8);
-        USB_FIFO0[0] = (uint8_t)(sIrq >> 16);
-        USB_FIFO0[1] = (uint8_t)(sIrq >> 24);
-        USB_FIFO0[2] = sEdgeL;
-        USB_FIFO0[3] = sEdgeH;
-        USB_FIFO0[0] = (uint8_t)sEdgeIrq;
-        USB_FIFO0[1] = (uint8_t)(sEdgeIrq >> 8);
-        USB_FIFO0[2] = (uint8_t)(sEdgeIrq >> 16);
-        USB_FIFO0[3] = (uint8_t)(sEdgeIrq >> 24);
-        USB_FIFO0[0] = ppsRun;
-        USB_FIFO0[1] = sGuard;
-        USB_FIFO0[2] = sCount;            
-        USB_FIFO0[3] = sFirstC;
-        USB_FIFO0[0] = sFrameL;
-        USB_FIFO0[1] = sFrameH;
-        USB_FIFO0[2] = ppsSrcSof;
-        USB_FIFO0[3] = ppsDivReload;
-        USB_FIFO0[0] = sLastSof;
-        USB_FIFO0[1] = sEdgeSof;
-        USB_FIFO0[2] = sFirstL;
-        USB_FIFO0[3] = sFirstH;
-        setup.wLength = 0;
-        USB_CSR0 = CSR0_TXPKTRDY | CSR0_DATAEND;
-        break;
-    }
-
     case REQ_PPS_ENABLE:
         ppsSrcSof = (setup.wValueL & 8) ? 1 : 0;
         ppsDivReload = setup.wValueH ? setup.wValueH : 1;
@@ -1271,10 +1250,10 @@ static void handleSetup(void)
                 ppsPaused = 1;          /* starts when the list ends */
             } else {
                 if (!ppsRun) { tickL = 0; tickH = 0; ppsDiv = 1; }
-                ppsRun = 1;
+                PPS_RUN(1);
             }
         } else {
-            ppsRun = 0;
+            PPS_RUN(0);
             ppsPaused = 0;
             tickL = 1; /* force the poll loop out on its next DJNZ */
         }
@@ -1294,18 +1273,6 @@ static void handleSetup(void)
         }
         ep0Ack();
         break;
-
-    case REQ_PPS_ANCHOR: {
-        uint8_t i;
-        USB_CSR0 = CSR0_SERV_RXPKTRDY;
-        for (i = 0; i < 16; i++)
-            USB_FIFO0[i & 3] = anchor[i];
-        USB_FIFO0[0] = anchorValid;
-        USB_FIFO0[1] = 0;
-        setup.wLength = 0;
-        USB_CSR0 = CSR0_TXPKTRDY | CSR0_DATAEND;
-        break;
-    }
 
     case REQ_UART_TX:
     case REQ_I2C_WRITE:
@@ -1487,7 +1454,7 @@ void streamIsr(void) __interrupt (0) __using (1)
         streamOn = 0;
         stopPending = 0;
         streamParked = 1;
-        ppsRun = 0;                     /* no packets, no PPS run */
+        PPS_RUN(0);                     /* no packets, no PPS run */
         STREAM_GUARD();
     }
 
@@ -1592,7 +1559,7 @@ static void usbReset(void)
     streamStop();
     stopPending = 0;
     streamParked = 0;
-    ppsRun = 0;
+    PPS_RUN(0);
     ppsSrcSof = 0;
     USB_INTRUSBE = INTRUSBE_BASE;
 
@@ -1701,29 +1668,29 @@ static void ppsPoll(void) __naked
         ret
     00003$:                             ; a high sample
         djnz    _ppsDiv,00004$          ; only every Nth: at 500 Hz the host
-        mov     _ppsDiv,_ppsDivReload   ; neither needs nor can use them all
-        inc     _edgeCount
+        mov     _ppsDiv,(_ppsBlk + 19)  ; neither needs nor can use them all
+        inc     (_ppsBlk + 14)
         clr     ea
-        mov     _edgeTickL,_tickL
+        mov     (_ppsBlk + 6),_tickL
         mov     a,_tickH                ; tickH counts down: the carries are -tickH
         cpl     a
         inc     a
-        mov     _edgeTickH,a
-        mov     _edgeIrq,_irqCount
-        mov     (_edgeIrq+1),(_irqCount+1)
-        mov     (_edgeIrq+2),(_irqCount+2)
-        mov     (_edgeIrq+3),(_irqCount+3)
-        mov     _edgeUsbGuard,_usbGuard
+        mov     (_ppsBlk + 7),a
+        mov     (_ppsBlk + 8),(_ppsBlk + 2)     ; edgeIrq = irqCount
+        mov     (_ppsBlk + 9),(_ppsBlk + 3)
+        mov     (_ppsBlk + 10),(_ppsBlk + 4)
+        mov     (_ppsBlk + 11),(_ppsBlk + 5)
+        mov     (_ppsBlk + 13),_usbGuard        ; edgeUsbGuard
         setb    ea
         ; which frame the edge fell in, read outside the critical section as it
         ; only moves every millisecond.  Taken for a GPIO_0 pulse too, so that
         ; ties to a frame number as well.
         mov     dptr,#0x400C            ; USB_FRAME_L
         movx    a,@dptr
-        mov     _edgeFrameL,a
+        mov     (_ppsBlk + 16),a
         inc     dptr
         movx    a,@dptr
-        mov     _edgeFrameH,a
+        mov     (_ppsBlk + 17),a
         mov     dptr,#0xC018            ; back to the GPIO input register
     00004$:
         movx    a,@dptr                 ; 2 cycles
@@ -1763,7 +1730,7 @@ void main(void)
             EA = 0;
             ppsPaused = 0;
             tickL = 0; tickH = 0; ppsDiv = 1;
-            ppsRun = 1;
+            PPS_RUN(1);
             STREAM_GUARD();             /* the first interval is partial */
             EA = 1;
         }
