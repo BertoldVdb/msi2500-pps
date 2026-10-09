@@ -614,7 +614,8 @@ static void uartSend(uint8_t n)
    a list runs, as the poll loop holds main, and resumes when it ends. */
 #define LIST_WAIT_US            0x80    /* busy wait, microseconds, 16 bit */
 #define LIST_WAIT_IRQ           0x81    /* streaming interrupts, 16 bit, counted from
-                                           the end of the wait before, so hops do not drift */
+                                           where the wait starts: a hop that ran late still
+                                           gets them all, and the hops after it move */
 #define LIST_REPEAT             0x82    /* back to the start, n more passes, 0 = forever */
 #define LIST_SWITCH             0x83    /* to the other bank, if it is queued */
 #define LIST_WAIT_SPI           0x84    /* the SPI master's done flags, at most n polls (~0.5 us
