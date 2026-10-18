@@ -1,20 +1,22 @@
 /*
- * msi2500.h - hardware definitions for the Mirics MSi2500 on-chip 8051
+ * msi2500.h: hardware definitions for the Mirics MSi2500 on-chip 8051
  *
  * Memory map. MOVC and MOVX mostly see the same address space, but not
  * everywhere: the USB controller is invisible to a code fetch, which reads a
  * fixed FA F5 F5 F5 throughout 0x4000-0x7FFF. RAM, the ROM mirror and the ADC
- * block read identically either way. 
+ * block read identically either way.
  *
- *   0x0000-0x0FFF  ROM0 / RAM0   (code: the ROM image is mirrored at
- *                                 0x2000 and 0x3000)
- *   0x1000-0x1FFF  RAM1          (this firmware puts its xdata at 0x1800)
- *   0x4000-0x41FF  USB device controller (Mentor MUSB), 0x100 bytes mirrored
- *   0x8000-0xBFFF  USB controller FIFO RAM (EP0 + EP1, P0.2 low)
- *   0xC000-0xDFFF  ADC / tuner / GPIO block, 0x100 bytes mirrored
+ *   0x0000-0x0FFF: ROM0 / RAM0, code. The ROM image is mirrored at 0x2000 and
+ *     0x3000.
+ *   0x1000-0x1FFF: RAM1. This firmware has its code up to 0x17FF, the host's
+ *     stubs at 0x1A00-0x1BFF, xdata at 0x1C00, the register list banks at
+ *     0x1D00-0x1EFF and the call gate's entry state at 0x1FF8.
+ *   0x4000-0x41FF: USB device controller (Mentor MUSB), 0x100 bytes mirrored
+ *   0x8000-0xBFFF: USB controller FIFO RAM (EP0 + EP1, P0.2 low)
+ *   0xC000-0xDFFF: ADC / tuner / GPIO block, 0x100 bytes mirrored
  *
  * When booting from RAM (BOOTSRC=1) the whole of 0x0000-0x1FFF is writable,
- * so code must stay below the xdata area at 0x1800.
+ * so code must stay below 0x1800, as the Makefile's --code-size has it.
  */
 #ifndef MSI2500_H
 #define MSI2500_H
@@ -37,19 +39,18 @@ volatile __sfr  __at (0xB8) IP;
 
 
 volatile __sfr __at (0xF0) B;
-#include <stdint.h>
 
 /* ------------------------------------------------------------------ */
-/* Non-standard SFRs                                                  */
+/* Non-standard SFRs */
 /* ------------------------------------------------------------------ */
 
-/* Boot source latch: 0 = boot from internal ROM, 1 = boot from RAM0.   */
+/* Boot source latch: 0 = boot from internal ROM, 1 = boot from RAM0. */
 volatile __sfr __at (0xC4) BOOTSRC;
-/* Writing 1 resets the 8051 core, it restarts from BOOTSRC.            */
+/* Writing 1 resets the 8051 core, it restarts from BOOTSRC. */
 volatile __sfr __at (0xC5) CORERESET;
 
 /* ------------------------------------------------------------------ */
-/* Control signals driven by the 8051                                 */
+/* Control signals driven by the 8051 */
 /* ------------------------------------------------------------------ */
 
 /* Enable/disable the streaming block */
@@ -63,7 +64,7 @@ volatile __sfr __at (0xC5) CORERESET;
 #define MEM_BUF_MAP(on)     (P0_2 = !(on))
 
 /* ------------------------------------------------------------------ */
-/* USB device controller (Mentor Graphics "MUSB" style register file)  */
+/* USB device controller (Mentor Graphics "MUSB" style register file) */
 /* ------------------------------------------------------------------ */
 
 #define USB_BASE        0x4000
@@ -77,9 +78,9 @@ volatile __sfr __at (0xC5) CORERESET;
 #define USB_INTRRXE_H   (*(__xdata volatile uint8_t *)(USB_BASE + 0x09))
 #define USB_INTRUSB     (*(__xdata volatile uint8_t *)(USB_BASE + 0x0A))
 #define USB_INTRUSBE    (*(__xdata volatile uint8_t *)(USB_BASE + 0x0B))
-/* The USB frame number, incremented by every SOF the host sends.  11 bits, so
+/* The USB frame number, incremented by every SOF the host sends. 11 bits, so
    bit 0 of the low byte is a 500 Hz square wave and the whole value wraps every
-   2.048 s.  A common register: INDEX does not select it. */
+   2.048 s. A common register: INDEX does not select it. */
 #define USB_FRAME_L     (*(__xdata volatile uint8_t *)(USB_BASE + 0x0C))
 #define USB_FRAME_H     (*(__xdata volatile uint8_t *)(USB_BASE + 0x0D))
 #define USB_INDEX       (*(__xdata volatile uint8_t *)(USB_BASE + 0x0E))
@@ -87,14 +88,14 @@ volatile __sfr __at (0xC5) CORERESET;
 #define USB_TXMAXP_H    (*(__xdata volatile uint8_t *)(USB_BASE + 0x11))
 #define USB_CSR0        (*(__xdata volatile uint8_t *)(USB_BASE + 0x12))
 /* Same address as CSR0, but that is what offset 0x12 means when INDEX
- * selects an endpoint other than 0.                                    */
+ * selects an endpoint other than 0. */
 #define USB_TXCSRL      (*(__xdata volatile uint8_t *)(USB_BASE + 0x12))
 #define USB_TXCSRH      (*(__xdata volatile uint8_t *)(USB_BASE + 0x13))
 #define USB_COUNT0      (*(__xdata volatile uint8_t *)(USB_BASE + 0x18))
 #define USB_FIFO0       ((__xdata volatile uint8_t *)(USB_BASE + 0x20))
 
-/* The EP0 FIFO is a four byte wide window; every access advances the
- * FIFO pointer, so a byte stream is written/read as FIFO0[n & 3].      */
+/* The EP0 FIFO is a four byte wide window. Every access advances the
+ * FIFO pointer, so a byte stream is written/read as FIFO0[n & 3]. */
 #define USB_FIFO0_BYTE(n)   USB_FIFO0[(n) & 3]
 
 /* POWER */
@@ -137,12 +138,12 @@ volatile __sfr __at (0xC5) CORERESET;
 #define TXCSRH_ISO          0x40
 
 /* ------------------------------------------------------------------ */
-/* ADC / tuner / GPIO block                                            */
+/* ADC / tuner / GPIO block */
 /* ------------------------------------------------------------------ */
 
 #define MMIO_WR_REG     (*(__xdata volatile uint8_t *)0xC000)
-#define MMIO_WR_LOW     (*(__xdata volatile uint8_t *)0xC001)   /* val[7:0]   */
-#define MMIO_WR_MID     (*(__xdata volatile uint8_t *)0xC002)   /* val[15:8]  */
+#define MMIO_WR_LOW     (*(__xdata volatile uint8_t *)0xC001)   /* val[7:0] */
+#define MMIO_WR_MID     (*(__xdata volatile uint8_t *)0xC002)   /* val[15:8] */
 #define MMIO_WR_HIGH    (*(__xdata volatile uint8_t *)0xC003)   /* val[23:16] */
 #define MMIO_RD(n)      ((__xdata volatile uint8_t *)(0xC000 + 4 * (n)))
 
@@ -157,7 +158,7 @@ volatile __sfr __at (0xC5) CORERESET;
 #define MMIO_REG_TUNER      0x09    /* the MSi001's serial port, ~2.15 us a word */
 #define MMIO_REG_GPIO       0x08    /* val bit 7 picks the GPIO supply, 1.8 V or 1.2 V,
                                      * val[15:12] = direction (1 = output),
-                                     * val[11:8]  = output value         */
+                                     * val[11:8] = output value */
 
 /* What the shadow starts at: supply bit set, every pin an input */
 #define MMIO_GPIO_IDLE      0x000080UL

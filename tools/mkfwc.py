@@ -19,7 +19,7 @@ with open(out, 'w') as f:
     f.write('/*\n'
             ' * %s: %d bytes%s.\n'
             ' *\n'
-            ' * Generated from %s by tools/mkfwc.py.  Do not edit.\n'
+            ' * Generated from %s by tools/mkfwc.py. Do not edit.\n'
             ' *\n'
             ' * The source this was built from lives at\n'
             ' * https://github.com/BertoldVdb/msi2500-pps\n'

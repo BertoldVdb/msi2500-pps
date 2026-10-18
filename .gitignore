@@ -1,0 +1,15 @@
+# build output
+*.asm
+*.lst
+*.rel
+*.rst
+*.sym
+*.ihx
+*.lk
+*.map
+*.mem
+*.adb
+*.cdb
+*.omf
+*.bin
+*_fw.c
