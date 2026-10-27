@@ -42,6 +42,35 @@ static __code uint8_t stringProduct[24] = {
 
 static __code uint8_t stringSerial[26] = { 0, DESC_STRING };
 
+/* High speed configuration: one interface with five alternate settings.
+ *   alt 0: no endpoints (idle)
+ *   alt 1: isochronous IN, 3 x 1024 bytes per microframe
+ *   alt 2: isochronous IN, 1024 bytes per microframe
+ *   alt 3: bulk IN, 512 bytes
+ *   alt 4: isochronous IN, 2 x 1024 bytes per microframe
+ * The full speed one follows in the same array, so one pointer in the block
+ * reaches both. Bus powered at 500 mA as built. A host loading the image for a
+ * self powered board sets bmAttributes and bMaxPower (bytes 7 and 8) in both. */
+#define CONFIG_HS_LEN   82
+#define CONFIG_FS_LEN   18
+
+static __code uint8_t configDesc[CONFIG_HS_LEN + CONFIG_FS_LEN] = {
+    9, DESC_CONFIGURATION, CONFIG_HS_LEN, 0, 1, 1, 0, 0x80, 250,   /* 500 mA */
+    9, 4, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0,
+    9, 4, 0, 1, 1, 0xFF, 0xFF, 0xFF, 0,
+    7, 5, 0x81, 0x01, 0x00, 0x14, 1,
+    9, 4, 0, 2, 1, 0xFF, 0xFF, 0xFF, 0,
+    7, 5, 0x81, 0x01, 0x00, 0x04, 1,
+    9, 4, 0, 3, 1, 0xFF, 0xFF, 0xFF, 0,
+    7, 5, 0x81, 0x02, 0x00, 0x02, 0,
+    9, 4, 0, 4, 1, 0xFF, 0xFF, 0xFF, 0,
+    7, 5, 0x81, 0x01, 0x00, 0x0C, 1,
+
+    /* Full speed configuration, not useful but required by USB */
+    9, DESC_CONFIGURATION, CONFIG_FS_LEN, 0, 1, 1, 0, 0x80, 250,
+    9, 4, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0
+};
+
 /* This block is read by the driver to identify the firmware */
 struct fwInfo {
     uint8_t  magic[4];
@@ -51,7 +80,10 @@ struct fwInfo {
     __data struct ppsState *ppsAt;      /* the status blocks: internal RAM, */
     __xdata struct anchorState *anchorAt;   /* xdata, */
     volatile __data struct listState *listAt;   /* internal RAM */
-    uint8_t  spare[4];
+    __code uint8_t *configDesc;         /* both configurations, see above */
+    uint8_t  length;                    /* of this block: a host reads no field past
+                                           it, older images have 0 here */
+    uint8_t  spare;
 };
 
 __code __at (0x0040) struct fwInfo fwBlock = {
@@ -62,7 +94,9 @@ __code __at (0x0040) struct fwInfo fwBlock = {
     &ppsBlk,
     &anchorBlk,
     &listBlk,
-    { 0, 0, 0, 0 }
+    configDesc,
+    sizeof(struct fwInfo),
+    0
 };
 
 static __code uint8_t qualifierDesc[10] = {
@@ -71,32 +105,6 @@ static __code uint8_t qualifierDesc[10] = {
     0xFF, 0xFF, 0xFF,
     8,
     1, 0
-};
-
-/* High speed configuration: one interface with five alternate settings.
- *   alt 0: no endpoints (idle)
- *   alt 1: isochronous IN, 3 x 1024 bytes per microframe
- *   alt 2: isochronous IN, 1024 bytes per microframe
- *   alt 3: bulk IN, 512 bytes
- *   alt 4: isochronous IN, 2 x 1024 bytes per microframe
- */
-static __code uint8_t configDesc[82] = {
-    9, DESC_CONFIGURATION, 82, 0, 1, 1, 0, 0x80, 250,   /* 500 mA */
-    9, 4, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0,
-    9, 4, 0, 1, 1, 0xFF, 0xFF, 0xFF, 0,
-    7, 5, 0x81, 0x01, 0x00, 0x14, 1,
-    9, 4, 0, 2, 1, 0xFF, 0xFF, 0xFF, 0,
-    7, 5, 0x81, 0x01, 0x00, 0x04, 1,
-    9, 4, 0, 3, 1, 0xFF, 0xFF, 0xFF, 0,
-    7, 5, 0x81, 0x02, 0x00, 0x02, 0,
-    9, 4, 0, 4, 1, 0xFF, 0xFF, 0xFF, 0,
-    7, 5, 0x81, 0x01, 0x00, 0x0C, 1
-};
-
-/* Full speed configuration, not useful but required by USB */
-static __code uint8_t otherSpeedDesc[18] = {
-    9, DESC_CONFIGURATION, 18, 0, 1, 1, 0, 0x80, 250,
-    9, 4, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0
 };
 
 void descRequest(void)
@@ -117,7 +125,7 @@ void descRequest(void)
 
     case DESC_CONFIGURATION:
         ep0CodePtr = configDesc;
-        length = configDesc[2] | ((uint16_t)configDesc[3] << 8);
+        length = CONFIG_HS_LEN;
         break;
 
     case DESC_STRING:
@@ -145,8 +153,8 @@ void descRequest(void)
         break;
 
     case DESC_OTHER_SPEED_CONFIG:
-        ep0CodePtr = otherSpeedDesc;
-        length = otherSpeedDesc[2] | ((uint16_t)otherSpeedDesc[3] << 8);
+        ep0CodePtr = configDesc + CONFIG_HS_LEN;
+        length = CONFIG_FS_LEN;
         break;
 
     default:
@@ -155,4 +163,10 @@ void descRequest(void)
     }
 
     ep0StartTx(length);
+}
+
+/* GET_STATUS for the device: bit 0 self powered, as the configuration says */
+uint8_t descSelfPowered(void)
+{
+    return (configDesc[7] & 0x40) ? 1 : 0;
 }

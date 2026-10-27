@@ -101,6 +101,9 @@ void regWriteRequest(void)
     /* a running list owns the registers: a write could land between its words, or
        reach the tuner port or the SPI master while the other is on the shared lines */
     if (listRun) { ep0Stall(); return; }
+    /* the port's registers are 0x00-0x1F, as a list takes them: mmioWrite()'s shadows go by
+       the low five bits, so a number past them would update one without writing it */
+    if (setup.wValueL >= 0x20) { ep0Stall(); return; }
     mmioWrite(setup.wValueL,
               (uint32_t)setup.wValueH
               | ((uint32_t)setup.wIndexL << 8)

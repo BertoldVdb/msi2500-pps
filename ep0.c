@@ -27,6 +27,7 @@ static __xdata uint8_t ep0Remap;   /* 0x44: map the capture memory in */
 
 __code  uint8_t *__data ep0CodePtr;
 static __xdata uint16_t ep0Sent;
+static __xdata uint8_t ep0Short;   /* less than the host asked for: a full last packet needs an empty one after */
 __xdata uint8_t ep0TypeByte;
 
 static __xdata uint8_t ep0Action;
@@ -49,16 +50,23 @@ static void ep0SendChunk(void)
         USB_FIFO0_BYTE(i) = v;
     }
 
-    /* what is left decides: nothing more to send ends the transfer */
+    /* what is left decides: nothing more to send ends the transfer. A full packet ends it
+       only where the host expects no more, otherwise an empty one follows (USB 2.0 5.5.3) */
     setup.wLength -= n;
-    USB_CSR0 = setup.wLength ? CSR0_TXPKTRDY : (CSR0_TXPKTRDY | CSR0_DATAEND);
-    ep0State = setup.wLength ? EP0_TX : EP0_IDLE;
+    if (setup.wLength || (ep0Short && n == EP0_MAXPACKET)) {
+        USB_CSR0 = CSR0_TXPKTRDY;
+        ep0State = EP0_TX;
+    } else {
+        USB_CSR0 = CSR0_TXPKTRDY | CSR0_DATAEND;
+        ep0State = EP0_IDLE;
+    }
 }
 
 void ep0StartTx(uint16_t length)
 {
     ep0Sent = 0;
-    if (length < setup.wLength)
+    ep0Short = length < setup.wLength;
+    if (ep0Short)
         setup.wLength = length;
 
     USB_CSR0 = CSR0_SERV_RXPKTRDY;
@@ -90,19 +98,27 @@ void ep0Ack(void)
     USB_CSR0 = CSR0_SERV_RXPKTRDY | CSR0_DATAEND;
 }
 
-/* Return a single byte in the data stage (GET_CONFIGURATION etc). */
+/* Return a single byte in the data stage (GET_CONFIGURATION etc), none if the host asked for none */
 void ep0SendByte(uint8_t value)
 {
     USB_CSR0 = CSR0_SERV_RXPKTRDY;
-    USB_FIFO0[0] = value;
+    if (setup.wLength) USB_FIFO0[0] = value;
     USB_CSR0 = CSR0_TXPKTRDY | CSR0_DATAEND;
 }
 
-/* Pull an OUT data packet into the buffer ep0StartRx() set up. */
+/* Pull an OUT data packet into the buffer ep0StartRx() set up. The handlers size their
+   buffers by wLength, so a packet past it is not taken: the request stalls instead. */
 static void ep0Receive(void)
 {
     uint8_t count = USB_COUNT0;
     uint8_t i;
+
+    if (count > setup.wLength) {
+        ep0Action = ACT_NONE;
+        ep0State = EP0_IDLE;
+        ep0Stall();
+        return;
+    }
 
     for (i = 0; i < count; i++) {
         uint8_t v = USB_FIFO0_BYTE(i);
@@ -150,6 +166,9 @@ static void handleSetup(void)
     case REQ_GET_STATUS: {
         uint8_t status = 0;
 
+        if ((setup.bmRequestType & 0x1F) == 0)
+            status = descSelfPowered();
+
         if ((setup.bmRequestType & 0x1F) == 2 && setup.wIndexL == 0x81) {
             usbIndex(1);
             if (USB_TXCSRL & TXCSRL_SENDSTALL)
@@ -157,9 +176,10 @@ static void handleSetup(void)
             usbIndex(0);
         }
 
+        /* two bytes, or as many of them as the host asked for */
         USB_CSR0 = CSR0_SERV_RXPKTRDY;
-        USB_FIFO0[0] = status;
-        USB_FIFO0[1] = 0;
+        if (setup.wLength > 0) USB_FIFO0[0] = status;
+        if (setup.wLength > 1) USB_FIFO0[1] = 0;
         setup.wLength = 0;
         USB_CSR0 = CSR0_TXPKTRDY | CSR0_DATAEND;
         break;

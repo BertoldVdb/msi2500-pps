@@ -8,4 +8,7 @@
 /* GET_DESCRIPTOR */
 void descRequest(void);
 
+/* 1 when the configuration says self powered */
+uint8_t descSelfPowered(void);
+
 #endif /* DESC_H */

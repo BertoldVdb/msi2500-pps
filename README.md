@@ -44,8 +44,30 @@ This produces:
 List entries are 4 bytes, `[register, value low, mid, high]` for a register below `0x20`, or a command with a 16 bit argument: `0x80` wait microseconds, `0x81` wait stream interrupts (counted from where the wait starts), `0x82` repeat from the start, `0x83` switch to the queued bank, `0x84` wait for the SPI master's done flag.
 
 The stock requests `0x40`-`0x45` are reimplemented based on experimentation and how the drivers use it.
+A register write (`0x41`) takes the registers below `0x20`, as a list does, and a data stage longer than its `wLength` is refused.
 See `requests.h` for the requests and list entries, the file each request's handler is in for its exact
 payload layout, and `msi2500.h` for the memory map and register definitions.
+
+## The firmware block
+
+At `0x0040` the image has a block a host reads to identify the firmware and to patch the image before loading it.
+Addresses are little endian.
+
+| Offset | Bytes | What |
+|--------|-------|------|
+| 0      | 4     | `BVDB` |
+| 4      | 8     | Build id, stamped after linking |
+| 12     | 2     | The device descriptor, where a host sets the USB ids |
+| 14     | 2     | The serial string descriptor |
+| 16     | 1     | PPS state, internal RAM |
+| 17     | 2     | Anchor state, xdata |
+| 19     | 1     | List state, internal RAM |
+| 20     | 2     | The configuration descriptors, high speed with full speed right behind it. Bus powered at 500 mA as built: for a self powered board a host sets `bmAttributes` and `bMaxPower` (bytes 7 and 8) in both |
+| 22     | 1     | The length of the block |
+| 23     | 1     | Spare |
+
+A host reads a field only when it ends within the length. Older images have 0 in its place, so their block ends at offset 20.
+GET_STATUS for the device reports self powered as the configuration says.
 
 ## Source layout
 

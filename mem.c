@@ -109,6 +109,7 @@ void memReadRequest(void)
 
 void memWriteRequest(void)
 {
+    if (!setup.wLength) { ep0Ack(); return; }  /* no data stage to wait for */
     ep0StartRx((__xdata uint8_t *)(uint16_t)(setup.wValueL | ((uint16_t)setup.wValueH << 8)),
                setup.wIndexL & 1, ACT_NONE);
 }
