@@ -101,6 +101,9 @@ void memReadRequest(void)
     MEM_BUF_MAP(0);
     EA = 1;
 
+    /* the host has the SOF edge: take a new one */
+    if ((setup.wValueL & 2) && (q == (__idata uint8_t *) &ppsBlk)) sofWanted = 1;
+
     /* code and xdata are one RAM: the descriptor path sends it */
     ep0CodePtr = (__code uint8_t *)xferBuf;
     ep0TypeByte = xferBuf[1];

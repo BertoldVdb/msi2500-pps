@@ -5,7 +5,9 @@ bridge. On top of the normal I/Q streaming it adds:
 
 - **PPS timestamping**: edges on GPIO_0 (or the USB SOF interrupt) are tied to
   the streaming interrupt count and the capture sample counter, so you can
-  locate a PPS edge in the sample stream.
+  locate a PPS edge in the sample stream. With SOF as the source an edge is the
+  first SOF that nothing disturbed after the host read the last one, and it
+  carries its frame and microframe.
 - **Bit-banged UART TX and I2C master** on GPIO_1 (SDA) and GPIO_2 (SCL/TX).
 - **USB compliance fixes**.
 
@@ -32,7 +34,7 @@ This produces:
 
 | Request | Purpose |
 |---------|---------|
-| `0x52`  | Enable/disable PPS capture, select source and divider, request an anchor |
+| `0x52`  | Enable/disable PPS capture, select the source, request an anchor |
 | `0x54`  | UART transmit (`wValue` = bit delay) |
 | `0x55`  | I2C write (`wValue` = address and flags, `wIndex` = delay) |
 | `0x56`  | I2C read |

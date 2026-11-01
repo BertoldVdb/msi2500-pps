@@ -51,7 +51,7 @@ void main(void)
         if (ppsPaused && !listRun) {
             EA = 0;
             ppsPaused = 0;
-            tickL = 0; tickH = 0; ppsDiv = 1;
+            tickL = 0; tickH = 0;
             PPS_RUN(1);
             STREAM_GUARD();             /* the first interval is partial */
             EA = 1;

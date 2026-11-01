@@ -15,13 +15,13 @@ __xdata struct anchorState anchorBlk;
 __data uint8_t  tickL, tickH;
 __bit ppsRun;
 __bit ppsSrcSof;
-__data uint8_t sofDiv, sofLastFrame;
+__data uint8_t sofLastFrame;
+__idata uint8_t sofWanted;
 __data uint8_t sofInInterval;
 __data uint8_t firstSofL, firstSofH, firstSofCarry;
 volatile __bit inSofLatch;
 volatile __bit sofStraddle;
 volatile __bit tickCarried;
-__data uint8_t ppsDiv;
 
 volatile __xdata uint8_t anchorPending;
 
@@ -64,8 +64,6 @@ void ppsPoll(void) __naked
         jb      _ppsRun,00005$          ; 2, four, and the turn it rejoins is two
         ret
     00003$:                             ; a high sample
-        djnz    _ppsDiv,00004$          ; only every Nth: at 500 Hz the host
-        mov     _ppsDiv,(_ppsBlk + 19)  ; neither needs nor can use them all
         inc     (_ppsBlk + 14)
         clr     ea
         mov     (_ppsBlk + 6),_tickL
@@ -104,14 +102,12 @@ void ppsPoll(void) __naked
 void ppsRequest(void)
 {
     ppsSrcSof = (setup.wValueL & 8) ? 1 : 0;
-    ppsDivReload = setup.wValueH ? setup.wValueH : 1;
-    sofDiv = 1;
 
     if (setup.wValueL & 1) {
         if (listRun) {
             ppsPaused = 1;          /* starts when the list ends */
         } else {
-            if (!ppsRun) { tickL = 0; tickH = 0; ppsDiv = 1; }
+            if (!ppsRun) { tickL = 0; tickH = 0; }
             PPS_RUN(1);
         }
     } else {

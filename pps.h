@@ -20,8 +20,8 @@ struct ppsState {
     uint8_t  run;                       /* ppsRun, which the poll loop tests as a bit */
     uint8_t  edgeUsbGuard, edgeCount, edgeFirstCarry;
     uint8_t  edgeFrameL, edgeFrameH;    /* USB frame the edge fell in */
+    uint8_t  edgeMicroframe;            /* and its microframe, with SOF as the source */
     uint8_t  spare;
-    uint8_t  ppsDivReload;              /* latch every Nth edge */
     uint8_t  lastSofCount, edgeSofCount, edgeFirstL, edgeFirstH;
 };
 
@@ -45,7 +45,7 @@ extern __xdata struct anchorState anchorBlk;
 #define edgeFirstCarry  ppsBlk.edgeFirstCarry
 #define edgeFrameL      ppsBlk.edgeFrameL
 #define edgeFrameH      ppsBlk.edgeFrameH
-#define ppsDivReload    ppsBlk.ppsDivReload
+#define edgeMicroframe  ppsBlk.edgeMicroframe
 #define lastSofCount    ppsBlk.lastSofCount
 #define edgeSofCount    ppsBlk.edgeSofCount
 #define edgeFirstL      ppsBlk.edgeFirstL
@@ -61,7 +61,8 @@ extern __data uint8_t  tickL, tickH; /* both count down: DJNZ is the cheapest co
                                         packet, the poll loop's own way out */
 extern __bit ppsRun;                 /* poll loop runs only while this is set */
 extern __bit ppsSrcSof;              /* edges from the SOF interrupt, not GPIO_0 */
-extern __data uint8_t sofDiv, sofLastFrame;
+extern __data uint8_t sofLastFrame;
+extern __idata uint8_t sofWanted;    /* the host read the last SOF edge, take another */
 /* SOF interrupts since the last streaming interrupt, and the tick the first of
    them fell on. A host places the edge from that first SOF plus a whole number
    of microframes, so what the handlers in between cost never enters the answer. */
@@ -71,7 +72,6 @@ extern volatile __bit inSofLatch;    /* the USB handler is running: a packet int
                                         taken late in here marks the interval */
 extern volatile __bit sofStraddle;   /* ...and a streaming interrupt landed there */
 extern volatile __bit tickCarried;   /* the interval opened on the loop's carry */
-extern __data uint8_t ppsDiv;                   /* counts down to the Nth edge */
 
 extern volatile __xdata uint8_t anchorPending;   /* the ISR clears it while a handler waits */
 

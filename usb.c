@@ -41,6 +41,10 @@ static void usbReset(void)
     USB_INTRTXE_L = INTRTX_EP0;
 }
 
+/* SOFs since the frame number last moved: the microframe, at high speed */
+static __idata uint8_t sofSinceFrame;
+
+
 void usbIsr(void) __interrupt (2) __using (2)
 {
     uint8_t intrUsb, intrTx, csr0, ep0Work;
@@ -55,12 +59,17 @@ void usbIsr(void) __interrupt (2) __using (2)
             uint8_t idx;
             uint8_t capture = 0;
 
+            /* At high speed the number moves on every 8th SOF, and can be read a moment
+               before it does: on the 8th since it last moved, wait for it, a while at most */
+            if ((++sofSinceFrame >= 8) && (f == sofLastFrame)) {
+                uint8_t n = 64;
+
+                do f = USB_FRAME_L; while ((f == sofLastFrame) && --n);
+            }
+
             if (f != sofLastFrame) {
                 sofLastFrame = f;
-                if ((f & 1) && --sofDiv == 0) {
-                    sofDiv = ppsDivReload;
-                    capture = 1;
-                }
+                sofSinceFrame = 0;
             }
 
             EA = 0;
@@ -72,7 +81,20 @@ void usbIsr(void) __interrupt (2) __using (2)
                               | ((usbGuard == 2 || usbGuard == GUARD_HELD) ? 4 : 0);
             }
             sofInInterval++;
+
+            /* Once the host has read the last edge, the next is the first SOF it would
+               trust, as its checks in pps.c go: no straddle or carry, nothing in the USB
+               interrupt before the interval's first SOF, and that SOF clear of both the
+               streaming interrupt's tail and a microframe on. The edge says which SOF it is */
+            if (sofWanted) {
+                uint16_t first = ((uint16_t) firstSofH << 8) | (uint8_t)(0 - firstSofL);
+
+                capture = !sofStraddle && !tickCarried && tickL && (!idx || firstSofL)
+                          && !(firstSofCarry & 4) && (first >= 3) && (first < 625);
+            }
             if (capture) {
+                sofWanted = 0;
+                edgeMicroframe = sofSinceFrame;
                 edgeTickL = tickL;
                 edgeTickH = (uint8_t)(0 - tickH);
                 edgeIrq = irqCount;
